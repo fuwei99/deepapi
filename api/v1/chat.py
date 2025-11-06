@@ -133,16 +133,12 @@ async def _run_engine_with_streaming(
     progress_queue = asyncio.Queue()
     
     def on_progress(event):
-        """捕获进度事件"""
         progress_queue.put_nowait(event)
     
-    # 设置进度回调
     engine.on_progress = on_progress
     
-    # UltraThink 特殊处理
     if hasattr(engine, 'on_agent_update'):
         def on_agent_update(agent_id: str, update: Dict[str, Any]):
-            """捕获 Agent 更新"""
             from models import ProgressEvent
             progress_queue.put_nowait(ProgressEvent(
                 type="agent-update",
@@ -150,131 +146,84 @@ async def _run_engine_with_streaming(
             ))
         engine.on_agent_update = on_agent_update
     
-    # 在后台运行引擎
     engine_task = asyncio.create_task(engine.run())
     
-    # 强力保活任务，每5秒发送一个空内容的数据块，防止任何中间件超时
-    async def keep_alive_sender():
+    async def keep_alive_sender(q: asyncio.Queue):
+        """每10秒向队列中放入一个保活信号"""
         while True:
-            await asyncio.sleep(5)  # 每 5 秒发送一次
-            delta = {"content": ""}
-            chunk_data = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(10)
+            await q.put("keep-alive")
 
-    keep_alive_task = asyncio.create_task(keep_alive_sender().__anext__())
-    
+    keep_alive_task = asyncio.create_task(keep_alive_sender(progress_queue))
+
     try:
-        # 同时处理引擎事件和保活任务
         while not engine_task.done():
-            # 使用 asyncio.wait 来同时监听引擎进度和保活
-            tasks = [
-                asyncio.create_task(progress_queue.get()),
-                keep_alive_task,
-            ]
+            get_event_task = asyncio.create_task(progress_queue.get())
+            
             done, pending = await asyncio.wait(
-                tasks,
-                return_when=asyncio.FIRST_COMPLETED,
+                [engine_task, get_event_task],
+                return_when=asyncio.FIRST_COMPLETED
             )
 
-            # 取消未完成的任务，避免资源泄漏
-            for task in pending:
-                task.cancel()
+            if get_event_task in pending:
+                get_event_task.cancel()
 
-            for task in done:
-                if task is keep_alive_task:
-                    # 如果是保活任务完成了
-                    yield task.result()
-                    # 重置保活任务
-                    keep_alive_task = asyncio.create_task(keep_alive_sender().__anext__())
-                else:
-                    # 如果是进度事件
-                    event = task.result()
-                    progress_queue.task_done()
-                    if thinking_generator:
-                        thinking_text = thinking_generator.process_event(event)
-                        if thinking_text:
-                            delta = {"reasoning_content": thinking_text}
-                            chunk_data = {
-                                "id": request_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
-                            }
-                            yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
-        
-        # 获取最终结果
-        result = await engine_task
-        
-        # 处理队列中剩余的事件
-        while not progress_queue.empty():
-            event = progress_queue.get_nowait()
-            if thinking_generator:
+            if engine_task in done:
+                break
+
+            event = get_event_task.result()
+            
+            if event == "keep-alive":
+                delta = {"content": ""}
+                chunk_data = {
+                    "id": request_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+            elif thinking_generator:
                 thinking_text = thinking_generator.process_event(event)
                 if thinking_text:
                     delta = {"reasoning_content": thinking_text}
                     chunk_data = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
+                        "id": request_id, "object": "chat.completion.chunk", "created": created, "model": model,
                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                     }
                     yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
         
-        # 流式发送最终答案
+        result = await engine_task
+        
+        while not progress_queue.empty():
+            event = progress_queue.get_nowait()
+            if event != "keep-alive" and thinking_generator:
+                thinking_text = thinking_generator.process_event(event)
+                if thinking_text:
+                    delta = {"reasoning_content": thinking_text}
+                    chunk_data = {
+                        "id": request_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+        
         final_text = result.summary or result.final_solution
         for i in range(0, len(final_text), 50):
             chunk = final_text[i:i+50]
             delta = {"content": chunk}
             chunk_data = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": None
-                }]
+                "id": request_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
             }
             yield f"data: {json.dumps(chunk_data)}\n\n"
             
     except GeneratorExit:
-        # 客户端断开连接，取消任务
         logger.info(f"Client disconnected for request {request_id}, cancelling tasks")
-        if not keep_alive_task.done():
-            keep_alive_task.cancel()
-        if not engine_task.done():
-            engine_task.cancel()
-            try:
-                await engine_task
-            except asyncio.CancelledError:
-                pass
     except Exception as e:
-        # 其他异常情况
-        logger.error(f"Error during streaming for request {request_id}: {e}")
-        if not keep_alive_task.done():
-            keep_alive_task.cancel()
-        if not engine_task.done():
-            engine_task.cancel()
-            try:
-                await engine_task
-            except asyncio.CancelledError:
-                pass
+        logger.error(f"Error during streaming for request {request_id}: {e}", exc_info=True)
         raise
     finally:
-        # 确保所有任务都被取消
-        if 'keep_alive_task' in locals() and not keep_alive_task.done():
-            keep_alive_task.cancel()
         if not engine_task.done():
             engine_task.cancel()
+        if not keep_alive_task.done():
+            keep_alive_task.cancel()
 
 
 async def stream_chat_completion(
