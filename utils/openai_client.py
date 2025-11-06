@@ -15,11 +15,16 @@ class OpenAIClient:
     """OpenAI 客户端包装器"""
     
     def __init__(self, base_url: str, api_key: str, rpm: Optional[int] = None, max_retry: int = 3):
+        # 创建一个禁用了 SSL 验证的 httpx 客户端
+        # 这可以解决 [SSL: CERTIFICATE_VERIFY_FAILED] 的问题
+        httpx_client = httpx.AsyncClient(verify=False)
+        
         # OpenAI客户端自己会管理连接，不需要我们操心
         self.client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
             max_retries=max_retry,
+            http_client=httpx_client,
         )
         self.rpm = rpm
         self.rate_limiter = None
