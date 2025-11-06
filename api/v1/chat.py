@@ -129,12 +129,12 @@ async def _run_engine_with_streaming(
     model: str,
     thinking_generator
 ) -> AsyncIterator[str]:
-    """运行引擎并流式输出结果"""
-    progress_queue = []
+    """运行引擎并流式输出结果，增加心跳以保持连接"""
+    progress_queue = asyncio.Queue()
     
     def on_progress(event):
         """捕获进度事件"""
-        progress_queue.append(event)
+        progress_queue.put_nowait(event)
     
     # 设置进度回调
     engine.on_progress = on_progress
@@ -144,7 +144,7 @@ async def _run_engine_with_streaming(
         def on_agent_update(agent_id: str, update: Dict[str, Any]):
             """捕获 Agent 更新"""
             from models import ProgressEvent
-            progress_queue.append(ProgressEvent(
+            progress_queue.put_nowait(ProgressEvent(
                 type="agent-update",
                 data={"agentId": agent_id, **update}
             ))
@@ -153,46 +153,61 @@ async def _run_engine_with_streaming(
     # 在后台运行引擎
     engine_task = asyncio.create_task(engine.run())
     
+    # 心跳任务，防止连接因空闲超时而断开
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(15)  # 每 15 秒发送一次心跳
+            yield ": heartbeat\n\n"
+
+    heartbeat_task = asyncio.create_task(heartbeat().__anext__())
+    
     try:
-        # 心跳定时器
-        last_heartbeat_time = time.time()
-        
-        # 流式发送进度
+        # 同时处理引擎事件和心跳
         while not engine_task.done():
-            # 发送心跳以保持连接活跃
-            if time.time() - last_heartbeat_time > 10:
-                yield ": ping\n\n"
-                last_heartbeat_time = time.time()
-                
-            # 处理队列中的进度事件
-            while progress_queue:
-                event = progress_queue.pop(0)
-                # 如果启用了 summary_think,将事件转换为思维链
-                if thinking_generator:
-                    thinking_text = thinking_generator.process_event(event)
-                    if thinking_text:
-                        # 使用 reasoning_content 字段输出推理过程
-                        delta = {"reasoning_content": thinking_text}
-                        chunk_data = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.1)  # 短暂等待避免busy loop
+            # 使用 asyncio.wait 来同时监听引擎进度和心跳
+            tasks = [
+                asyncio.create_task(progress_queue.get()),
+                heartbeat_task,
+            ]
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=15, # 设置一个超时，以防万一
+            )
+
+            # 取消未完成的任务，避免资源泄漏
+            for task in pending:
+                task.cancel()
+
+            for task in done:
+                if task is heartbeat_task:
+                    # 如果是心跳任务完成了
+                    yield task.result()
+                    # 重置心跳任务
+                    heartbeat_task = asyncio.create_task(heartbeat().__anext__())
+                else:
+                    # 如果是进度事件
+                    event = task.result()
+                    progress_queue.task_done()
+                    if thinking_generator:
+                        thinking_text = thinking_generator.process_event(event)
+                        if thinking_text:
+                            delta = {"reasoning_content": thinking_text}
+                            chunk_data = {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                            }
+                            yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
         
         # 获取最终结果
         result = await engine_task
         
-        # 处理剩余的进度事件
-        while progress_queue:
-            event = progress_queue.pop(0)
+        # 处理队列中剩余的事件
+        while not progress_queue.empty():
+            event = progress_queue.get_nowait()
             if thinking_generator:
                 thinking_text = thinking_generator.process_event(event)
                 if thinking_text:
@@ -202,11 +217,7 @@ async def _run_engine_with_streaming(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": delta,
-                            "finish_reason": None
-                        }]
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                     }
                     yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
         
@@ -229,25 +240,34 @@ async def _run_engine_with_streaming(
             yield f"data: {json.dumps(chunk_data)}\n\n"
             
     except GeneratorExit:
-        # 客户端断开连接，取消引擎任务
-        logger.info(f"Client disconnected for request {request_id}, cancelling engine task")
-        if engine_task and not engine_task.done():
-            engine_task.cancel()
-            try:
-                await engine_task
-            except asyncio.CancelledError:
-                pass  # 预期的取消异常
-        # 不重新抛出 GeneratorExit，让生成器正常结束
-    except (asyncio.CancelledError, Exception) as e:
-        # 其他异常情况，记录日志并取消任务
-        logger.error(f"Error during streaming for request {request_id}: {e}")
-        if engine_task and not engine_task.done():
+        # 客户端断开连接，取消任务
+        logger.info(f"Client disconnected for request {request_id}, cancelling tasks")
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+        if not engine_task.done():
             engine_task.cancel()
             try:
                 await engine_task
             except asyncio.CancelledError:
                 pass
-        raise  # 重新抛出异常
+    except Exception as e:
+        # 其他异常情况
+        logger.error(f"Error during streaming for request {request_id}: {e}")
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+        if not engine_task.done():
+            engine_task.cancel()
+            try:
+                await engine_task
+            except asyncio.CancelledError:
+                pass
+        raise
+    finally:
+        # 确保所有任务都被取消
+        if 'heartbeat_task' in locals() and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        if not engine_task.done():
+            engine_task.cancel()
 
 
 async def stream_chat_completion(
