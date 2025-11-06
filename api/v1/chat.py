@@ -153,26 +153,33 @@ async def _run_engine_with_streaming(
     # 在后台运行引擎
     engine_task = asyncio.create_task(engine.run())
     
-    # 心跳任务，防止连接因空闲超时而断开
-    async def heartbeat():
+    # 强力保活任务，每5秒发送一个空内容的数据块，防止任何中间件超时
+    async def keep_alive_sender():
         while True:
-            await asyncio.sleep(15)  # 每 15 秒发送一次心跳
-            yield ": heartbeat\n\n"
+            await asyncio.sleep(5)  # 每 5 秒发送一次
+            delta = {"content": ""}
+            chunk_data = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
 
-    heartbeat_task = asyncio.create_task(heartbeat().__anext__())
+    keep_alive_task = asyncio.create_task(keep_alive_sender().__anext__())
     
     try:
-        # 同时处理引擎事件和心跳
+        # 同时处理引擎事件和保活任务
         while not engine_task.done():
-            # 使用 asyncio.wait 来同时监听引擎进度和心跳
+            # 使用 asyncio.wait 来同时监听引擎进度和保活
             tasks = [
                 asyncio.create_task(progress_queue.get()),
-                heartbeat_task,
+                keep_alive_task,
             ]
             done, pending = await asyncio.wait(
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED,
-                timeout=15, # 设置一个超时，以防万一
             )
 
             # 取消未完成的任务，避免资源泄漏
@@ -180,11 +187,11 @@ async def _run_engine_with_streaming(
                 task.cancel()
 
             for task in done:
-                if task is heartbeat_task:
-                    # 如果是心跳任务完成了
+                if task is keep_alive_task:
+                    # 如果是保活任务完成了
                     yield task.result()
-                    # 重置心跳任务
-                    heartbeat_task = asyncio.create_task(heartbeat().__anext__())
+                    # 重置保活任务
+                    keep_alive_task = asyncio.create_task(keep_alive_sender().__anext__())
                 else:
                     # 如果是进度事件
                     event = task.result()
@@ -242,8 +249,8 @@ async def _run_engine_with_streaming(
     except GeneratorExit:
         # 客户端断开连接，取消任务
         logger.info(f"Client disconnected for request {request_id}, cancelling tasks")
-        if not heartbeat_task.done():
-            heartbeat_task.cancel()
+        if not keep_alive_task.done():
+            keep_alive_task.cancel()
         if not engine_task.done():
             engine_task.cancel()
             try:
@@ -253,8 +260,8 @@ async def _run_engine_with_streaming(
     except Exception as e:
         # 其他异常情况
         logger.error(f"Error during streaming for request {request_id}: {e}")
-        if not heartbeat_task.done():
-            heartbeat_task.cancel()
+        if not keep_alive_task.done():
+            keep_alive_task.cancel()
         if not engine_task.done():
             engine_task.cancel()
             try:
@@ -264,8 +271,8 @@ async def _run_engine_with_streaming(
         raise
     finally:
         # 确保所有任务都被取消
-        if 'heartbeat_task' in locals() and not heartbeat_task.done():
-            heartbeat_task.cancel()
+        if 'keep_alive_task' in locals() and not keep_alive_task.done():
+            keep_alive_task.cancel()
         if not engine_task.done():
             engine_task.cancel()
 
