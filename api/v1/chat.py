@@ -154,8 +154,16 @@ async def _run_engine_with_streaming(
     engine_task = asyncio.create_task(engine.run())
     
     try:
+        # 心跳定时器
+        last_heartbeat_time = time.time()
+        
         # 流式发送进度
         while not engine_task.done():
+            # 发送心跳以保持连接活跃
+            if time.time() - last_heartbeat_time > 10:
+                yield ": ping\n\n"
+                last_heartbeat_time = time.time()
+                
             # 处理队列中的进度事件
             while progress_queue:
                 event = progress_queue.pop(0)
