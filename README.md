@@ -117,6 +117,64 @@ docker ps --format "table {{.Names}}\t{{.Status}}"
 3. 配置日志收集
 4. 使用HTTPS和适当的认证
 
+## 部署到 Hugging Face Spaces
+
+本项目支持通过 Docker 部署到 Hugging Face Spaces。
+
+### 1. 创建 Space
+
+在 Hugging Face 上创建一个新的 Space，选择 "Docker" SDK。
+
+### 2. 配置 Secret
+
+为了安全地管理你的 API 密钥等敏感信息, 你需要使用 Hugging Face Spaces 的 Secrets 功能。
+
+1.  在你的 Space 页面，进入 "Settings" -> "Secrets"。
+2.  点击 "New secret"。
+3.  **Secret name**: `CONFIG`
+4.  **Secret value**: 将你的 `config.yaml` 文件的**全部内容**复制并粘贴到这里。请确保你已经填写了所有必要的字段，例如提供商的 API 密钥。
+
+   例如:
+   ```yaml
+   system:
+     key: "your-api-key-here"
+     # ... 其他配置 ...
+   provider:
+     openai:
+       base_url: "https://api.openai.com/v1"
+       key: "sk-..." # 填入你的真实 OpenAI Key
+   # ... 其他模型配置 ...
+   ```
+
+### 3. 创建 `README.md`
+
+在你的 Space 仓库中，创建一个 `README.md` 文件，并包含以下内容来告诉 Hugging Face如何运行你的应用：
+
+```yaml
+---
+title: Deep Think API
+sdk: docker
+app_port: 7860
+---
+```
+
+### 4. 推送代码
+
+将本项目的所有文件（除了 `config.yaml`）推送到你的 Hugging Face Space 仓库。应用会自动构建并启动。
+
+```bash
+# 克隆你的 Space 仓库
+git clone https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME
+
+# 添加你的代码
+cp -r /path/to/your/deepapi/* .
+
+# 提交并推送
+git add .
+git commit -m "Initial commit"
+git push
+```
+
 ## API 使用
 
 ### 聊天补全

@@ -110,18 +110,23 @@ class Config:
             self.load()
     
     def load(self, config_path: Optional[Path] = None):
-        """加载配置文件"""
-        if config_path:
-            self.config_path = config_path
-        
-        if not self.config_path.exists():
-            raise FileNotFoundError(
-                f"配置文件不存在: {self.config_path}\n"
-                f"请复制 config.yaml.example 为 config.yaml 并填写配置"
-            )
-        
-        with open(self.config_path, 'r', encoding='utf-8') as f:
-            self._config = yaml.safe_load(f)
+        """加载配置文件或从环境变量加载"""
+        config_data = os.environ.get("CONFIG")
+        if config_data:
+            self._config = yaml.safe_load(config_data)
+        else:
+            if config_path:
+                self.config_path = config_path
+            
+            if not self.config_path.exists():
+                raise FileNotFoundError(
+                    f"配置文件不存在: {self.config_path}\n"
+                    f"请复制 config.yaml.example 为 config.yaml 并填写配置, "
+                    f"或设置 CONFIG 环境变量"
+                )
+            
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                self._config = yaml.safe_load(f)
         
         # 加载提供商配置
         providers = self._config.get("provider", {})
@@ -146,7 +151,8 @@ class Config:
     @property
     def port(self) -> int:
         """服务器端口"""
-        return self._config.get("system", {}).get("port", 8000)
+        # Hugging Face Spaces uses PORT env var, default to 7860
+        return int(os.environ.get("PORT", self._config.get("system", {}).get("port", 7860)))
     
     @property
     def log_level(self) -> str:
